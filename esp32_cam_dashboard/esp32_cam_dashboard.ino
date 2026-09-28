@@ -32,14 +32,12 @@
 // VERCEL
 // ============================================================
 
+// Vercel relay. The device is behind NAT, so the dashboard
+// cannot poll it directly. It POSTs here instead and the
+// dashboard reads it back from Vercel.
+// https://<host>/api/device
 #define VERCEL_HOST "https://dashboard-mocha-eight-63.vercel.app"
-
-// Existing Vercel API from your previous code
-#define VERCEL_PING_ENDPOINT "/api/esp32-ping"
-
-// Camera upload endpoint
-// Change this ONLY if your Vercel API uses another endpoint.
-#define VERCEL_CAMERA_ENDPOINT "/api/camera/frame"
+#define VERCEL_ENDPOINT "/api/device"
 
 // ============================================================
 // WIFI SETUP AP
@@ -412,13 +410,8 @@ a.btn:hover { background: #222; }
   </div>
 
   <div class="card">
-    <div class="k">Clients</div>
+    <div class="k">Relay</div>
     <div class="v" id="clients">-</div>
-  </div>
-
-  <div class="card">
-    <div class="k">Vercel</div>
-    <div class="v" id="vercel">-</div>
   </div>
 
 </div>
@@ -473,8 +466,7 @@ async function poll() {
     set("uptime", fmtUptime(d.uptime));
     set("heap", Math.round(d.heap / 1024) + " KB");
     set("psram", d.psram > 0 ? Math.round(d.psram / 1024) + " KB" : "none");
-    set("clients", d.clients);
-    set("vercel", d.vercelCode);
+    set("clients", d.vercelOk ? "relay ok" : "relay failing", d.vercelOk);
 
   } catch (e) {
 
@@ -1149,7 +1141,7 @@ void handleStream() {
 // STATUS
 // ============================================================
 
-void handleStatus() {
+String statusJson() {
 
   String json = "{";
 
@@ -1229,22 +1221,6 @@ void handleStatus() {
   json += ",";
 
   json +=
-    "\"clients\":";
-
-  json +=
-    String(WiFi.softAPgetStationNum());
-
-  json += ",";
-
-  json +=
-    "\"vercelCode\":";
-
-  json +=
-    lastVercelCode;
-
-  json += ",";
-
-  json +=
     "\"vercelOk\":";
 
   json +=
@@ -1252,19 +1228,14 @@ void handleStatus() {
       ? "true"
       : "false";
 
-  json += ",";
-
-  json +=
-    "\"vercel\":\"";
-
-  json +=
-    VERCEL_HOST;
-
-  json += "\"";
-
   json += "}";
 
-  // CORS so the Vercel-hosted dashboard can poll this
+  return json;
+}
+
+void handleStatus() {
+
+  // CORS so a browser on another origin can read this
   server.sendHeader(
     "Access-Control-Allow-Origin",
     "*"
@@ -1273,7 +1244,7 @@ void handleStatus() {
   server.send(
     200,
     "application/json",
-    json
+    statusJson()
   );
 }
 
@@ -1478,32 +1449,31 @@ void startSetupAP() {
 }
 
 // ============================================================
-// VERCEL HTTPS GET
+// VERCEL RELAY
+//
+// Device is behind NAT, so it pushes state to Vercel and the
+// dashboard reads it back from there. One helper, two callers:
+// status JSON and a JPEG frame.
 // ============================================================
 
-void vercelPing() {
+int vercelPost(
+  const char *contentType,
+  const uint8_t *body,
+  size_t len
+) {
 
   if (
     WiFi.status() !=
     WL_CONNECTED
   ) {
-    return;
+    return -1;
   }
 
   String url =
     String(VERCEL_HOST) +
-    VERCEL_PING_ENDPOINT;
-
-  Serial.println();
-  Serial.print(
-    "[Vercel] GET "
-  );
-
-  Serial.println(url);
+    VERCEL_ENDPOINT;
 
   WiFiClientSecure client;
-
-  // Same HTTPS method as your previous sketch
   client.setInsecure();
 
   HTTPClient http;
@@ -1519,66 +1489,96 @@ void vercelPing() {
       "[Vercel] http.begin failed"
     );
 
-    return;
+    return -1;
   }
 
   http.setTimeout(
-    10000
+    15000
+  );
+
+  http.addHeader(
+    "Content-Type",
+    contentType
   );
 
   http.addHeader(
     "User-Agent",
-    "WorkBetter-ESP32-CAM/1.0"
+    "ESP32-CAM/1.0"
   );
 
   int code =
-    http.GET();
+    http.POST(
+      body,
+      len
+    );
 
   lastVercelCode = code;
 
   Serial.print(
-    "[Vercel] HTTP "
+    "[Vercel] POST "
   );
 
-  Serial.println(code);
+  Serial.print(url);
 
-  if (code > 0) {
+  Serial.print(
+    " -> "
+  );
 
-    String response =
-      http.getString();
+  Serial.print(code);
+
+  Serial.print(
+    " ("
+  );
+
+  Serial.print(len);
+
+  Serial.println(
+    " bytes)"
+  );
+
+  if (code < 0) {
+
+    Serial.print(
+      "[Vercel] Error: "
+    );
+
+    Serial.println(
+      http.errorToString(code)
+    );
+
+  } else if (code == 200) {
 
     Serial.print(
       "[Vercel] Response: "
     );
 
     Serial.println(
-      response
+      http.getString()
     );
   }
 
   http.end();
+
+  return code;
 }
 
-// ============================================================
-// VERCEL CAMERA FRAME UPLOAD
-// ============================================================
+void pushStatusToVercel() {
 
-void uploadFrameToVercel() {
+  String json =
+    statusJson();
 
-  if (
-    WiFi.status() !=
-    WL_CONNECTED
-  ) {
-    return;
-  }
+  vercelPost(
+    "application/json",
+    (const uint8_t *)json.c_str(),
+    json.length()
+  );
+}
+
+void pushFrameToVercel() {
 
   if (!cameraReady) {
     return;
   }
-
-  Serial.println(
-    "[Vercel] Capturing frame..."
-  );
 
   camera_fb_t *fb =
     esp_camera_fb_get();
@@ -1592,98 +1592,11 @@ void uploadFrameToVercel() {
     return;
   }
 
-  String url =
-    String(VERCEL_HOST) +
-    VERCEL_CAMERA_ENDPOINT;
-
-  Serial.print(
-    "[Vercel] Upload: "
+  vercelPost(
+    "image/jpeg",
+    fb->buf,
+    fb->len
   );
-
-  Serial.println(url);
-
-  WiFiClientSecure client;
-
-  // HTTPS
-  // Same approach as your previous Vercel code.
-  client.setInsecure();
-
-  HTTPClient http;
-
-  if (
-    !http.begin(
-      client,
-      url
-    )
-  ) {
-
-    Serial.println(
-      "[Vercel] http.begin failed"
-    );
-
-    esp_camera_fb_return(
-      fb
-    );
-
-    return;
-  }
-
-  http.setTimeout(
-    15000
-  );
-
-  http.addHeader(
-    "Content-Type",
-    "image/jpeg"
-  );
-
-  http.addHeader(
-    "User-Agent",
-    "ESP32-CAM/1.0"
-  );
-
-  http.addHeader(
-    "X-Device-ID",
-    "esp32-cam"
-  );
-
-  int code =
-    http.POST(
-      fb->buf,
-      fb->len
-    );
-
-  Serial.print(
-    "[Vercel] Frame HTTP: "
-  );
-
-  Serial.println(code);
-
-  if (code > 0) {
-
-    String response =
-      http.getString();
-
-    Serial.print(
-      "[Vercel] Response: "
-    );
-
-    Serial.println(
-      response
-    );
-
-  } else {
-
-    Serial.print(
-      "[Vercel] Error: "
-    );
-
-    Serial.println(
-      http.errorToString(code)
-    );
-  }
-
-  http.end();
 
   esp_camera_fb_return(
     fb
@@ -1823,8 +1736,8 @@ void setup() {
 
     delay(1000);
 
-    // First Vercel connection
-    vercelPing();
+    // First push to Vercel
+    pushStatusToVercel();
 
   } else {
 
@@ -1866,7 +1779,8 @@ void loop() {
   checkWiFi();
 
   // ----------------------------------------------------------
-  // Vercel heartbeat
+  // Push state to Vercel. The dashboard reads it from there,
+  // so the device needs no inbound port.
   // ----------------------------------------------------------
 
   if (
@@ -1883,7 +1797,7 @@ void loop() {
       lastVercelPing =
         millis();
 
-      vercelPing();
+      pushStatusToVercel();
     }
 
     // --------------------------------------------------------
@@ -1899,7 +1813,7 @@ void loop() {
       lastFrameUpload =
         millis();
 
-      uploadFrameToVercel();
+      pushFrameToVercel();
     }
   }
 
