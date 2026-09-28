@@ -27,6 +27,8 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include "esp_camera.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // ============================================================
 // VERCEL
@@ -84,22 +86,26 @@ Preferences prefs;
 // STATE
 // ============================================================
 
-bool cameraReady = false;
-bool apMode = false;
+// volatile: cameraReady, apMode and lastVercelCode are written by
+// setup()/loop() on one task and read by streamTask on another.
+volatile bool cameraReady = false;
+volatile bool apMode = false;
+volatile int lastVercelCode = 0;
 
 unsigned long lastWifiRetry = 0;
 unsigned long lastVercelPing = 0;
-unsigned long lastFrameUpload = 0;
 unsigned long bootMillis = 0;
 
-int lastVercelCode = 0;
-
 #define VERCEL_PING_INTERVAL  30000UL
-// Frame rate of the remote stream. 700ms ~= 1.4fps over the relay.
-// ponytail: JPEG size x this rate is the whole bandwidth bill. At VGA
-// q12 that is roughly 60KB every 700ms (~7Mbps up). Drop FRAMESIZE to
-// SVGA/HVGA and raise jpeg_quality (number = worse) if that hurts.
-#define FRAME_UPLOAD_INTERVAL 700UL
+// Frame pacing for the remote stream. This is a floor, not the real
+// rate: streamTask also spends the length of each HTTPS POST here, so
+// actual fps is whatever the link sustains. 300ms ~= 3fps on a good
+// connection, 1fps on a weak one.
+// ponytail: JPEG size x rate is the whole bandwidth bill. At VGA q12
+// that is ~60KB/frame, so 3fps ~= 1.4Mbps up. Drop FRAMESIZE to
+// FRAMESIZE_SVGA and raise jpeg_quality (higher number = worse) if
+// that hurts.
+#define FRAME_UPLOAD_INTERVAL 300UL
 
 // ============================================================
 // HTML CAMERA PAGE
@@ -1837,39 +1843,56 @@ void pushStatusToVercel() {
 // PUSH CAMERA FRAME TO VERCEL
 // ============================================================
 
-void pushFrameToVercel() {
+// ponytail: runs on its own task so the HTTPS POST does not block the
+// main loop. Without this, every frame stalls loop() for the length of
+// the upload and the stream serialises into a slideshow. Ceiling: the
+// camera driver's frame buffers are shared with the local /stream
+// handler - only one task may hold a buffer at a time, so local stream
+// and upload contend. A camera driver with a queue would fix it.
+void streamTask(void *arg) {
 
-  // ponytail: this blocks the loop for the whole HTTPS POST, so the
-  // local /stream and /capture page stutter while a frame is going up
-  // and the real frame rate is capped by upload time rather than by
-  // FRAME_UPLOAD_INTERVAL. Non-blocking upload (a FreeRTOS task) if
-  // the local page needs to stay smooth.
-  if (!cameraReady) {
+  for (;;) {
 
-    return;
-  }
+    if (
+      apMode ||
+      !cameraReady ||
+      WiFi.status() != WL_CONNECTED
+    ) {
 
-  camera_fb_t *fb =
-    esp_camera_fb_get();
+      vTaskDelay(pdMS_TO_TICKS(1000));
 
-  if (!fb) {
+      continue;
+    }
 
-    Serial.println(
-      "[Vercel] Camera capture failed"
+    camera_fb_t *fb =
+      esp_camera_fb_get();
+
+    if (!fb) {
+
+      Serial.println(
+        "[Vercel] Camera capture failed"
+      );
+
+      vTaskDelay(pdMS_TO_TICKS(FRAME_UPLOAD_INTERVAL));
+
+      continue;
+    }
+
+    vercelPost(
+      "image/jpeg",
+      fb->buf,
+      fb->len
     );
 
-    return;
+    esp_camera_fb_return(
+      fb
+    );
+
+    // Pace on the POST itself, not a fixed interval: when the network is
+    // slow the task simply spends longer in vercelPost, so frames never
+    // pile up and the stream stays as live as the link allows.
+    vTaskDelay(pdMS_TO_TICKS(FRAME_UPLOAD_INTERVAL));
   }
-
-  vercelPost(
-    "image/jpeg",
-    fb->buf,
-    fb->len
-  );
-
-  esp_camera_fb_return(
-    fb
-  );
 }
 
 // ============================================================
@@ -2013,6 +2036,19 @@ void setup() {
     // First Vercel status push
     pushStatusToVercel();
 
+    // Frame uploads run on their own task so the HTTPS POST does not
+    // stall the web server loop. Pinned to core 1: WiFi and TLS already
+    // live on core 0, leaving this for camera capture and the upload.
+    xTaskCreatePinnedToCore(
+      streamTask,
+      "stream",
+      8192,
+      NULL,
+      1,
+      NULL,
+      1
+    );
+
   } else {
 
     startSetupAP();
@@ -2076,23 +2112,10 @@ void loop() {
 
       pushStatusToVercel();
     }
-
-    // --------------------------------------------------------
-    // Camera frame
-    // --------------------------------------------------------
-
-    if (
-      millis() -
-      lastFrameUpload >=
-      FRAME_UPLOAD_INTERVAL
-    ) {
-
-      lastFrameUpload =
-        millis();
-
-      pushFrameToVercel();
-    }
   }
 
+  // Frames go out from streamTask, not here. The status POST above is
+  // still blocking but it is one small request every 30s, which the loop
+  // can absorb.
   delay(2);
 }

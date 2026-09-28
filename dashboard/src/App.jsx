@@ -1,24 +1,22 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ponytail: fast poll of our own /api/device relay, not the camera.
-// The camera is behind NAT with no inbound port, and an https page
-// cannot load an http:// image anyway, so every frame has to come
-// through Vercel. The ETag/304 on the relay means a poll that finds
-// no new frame costs a few bytes, not a whole JPEG.
-const POLL_MS = 400;
+// ponytail: video comes from <img src="/api/device">. The browser decodes
+// multipart/x-mixed-replace natively, so there is no player and no fetch
+// loop. Ceiling: Vercel cuts the function at 60s, so we reconnect on
+// error. The ESP32 cannot be streamed to directly (NAT, and an https
+// page cannot load an http:// image) - everything goes through here.
+const STREAM = "/api/device";
+const POLL_MS = 5000;
 
-// Ceiling: this can never beat the device's FRAME_UPLOAD_INTERVAL,
-// and the relay adds one relay hop. Real streaming wants a
-// long-lived chunked response (MJPEG over SSE) on the device.
+// Status ages out at 45s: device pushes every 30s, so two missed pushes
+// means it is gone.
+const STALE_MS = 45000;
+
 const fmtUptime = (ms) => {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h ` +
     `${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 };
-
-// Status ages out at 45s: ESP32 pushes every 30s, so two missed
-// pushes means it is gone.
-const STALE_MS = 45000;
 
 const CARDS = [
   ["wifi", "WiFi", (d) => d.wifi, (d) => d.wifi === "connected"],
@@ -33,26 +31,27 @@ const CARDS = [
 ];
 
 export default function App() {
-  const [relay, setRelay] = useState(null);
+  const [d, setD] = useState(null);
   const [err, setErr] = useState("");
+  const [age, setAge] = useState(null);
   const [big, setBig] = useState(false);
+  // Bumped to restart the stream. Changing this is the whole reconnect.
+  const [attempt, setAttempt] = useState(0);
   const img = useRef(null);
 
+  // Status is cheap JSON on a separate path, so the stream can hold this
+  // request open without blocking anything.
   useEffect(() => {
     let stop = false;
     const tick = async () => {
       try {
-        // "no-cache" revalidates: sends If-None-Match and honours a
-        // 304. "no-store" would skip the HTTP cache and re-download
-        // the whole frame on every poll.
-        const r = await fetch("/api/device", { cache: "no-cache" });
-        // 304 means no new frame. Keep the old <img> src so the
-        // picture does not flicker black between frames.
+        const r = await fetch(`${STREAM}?json=1`, { cache: "no-cache" });
         if (r.status === 304) return;
         if (!r.ok) throw new Error(`relay ${r.status}`);
         const j = await r.json();
         if (stop) return;
-        setRelay(j);
+        setD(j.status);
+        setAge(j.seenAt ? Date.now() - Date.parse(j.seenAt) : null);
         setErr(j.status ? "" : "waiting for camera to push");
       } catch (e) {
         if (!stop) setErr(e.message);
@@ -64,9 +63,15 @@ export default function App() {
       stop = true;
       clearInterval(id);
     };
-  }, []);
+  }, [attempt]);
 
-  // Fullscreen the live view, the way a security monitor should work.
+  // Reconnect when the platform cuts the stream, with a small backoff so a
+  // dead relay does not spin.
+  const onStreamEnd = useCallback(() => {
+    const wait = Math.min(1000 * 2 ** Math.min(attempt, 4), 15000);
+    setTimeout(() => setAttempt((a) => a + 1), wait);
+  }, [attempt]);
+
   const toggleBig = useCallback(() => {
     if (document.fullscreenElement) return document.exitFullscreen();
     img.current?.requestFullscreen?.();
@@ -79,20 +84,21 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const on = (e) => e.key === "f" && !e.target.matches("input,textarea") && toggleBig();
+    const on = (e) =>
+      e.key === "f" && !e.target.matches("input,textarea") && toggleBig();
     window.addEventListener("keydown", on);
     return () => window.removeEventListener("keydown", on);
   }, [toggleBig]);
 
-  const d = relay?.status;
-  const age = relay?.seenAt ? Date.now() - Date.parse(relay.seenAt) : null;
   const online = d && age != null && age < STALE_MS;
 
   return (
     <>
       <h1>ESP32-CAM</h1>
       <div className="sub">
-        {online ? `seen ${Math.round(age / 1000)}s ago` : "offline"}
+        <span className={online ? "ok" : "bad"}>
+          {online ? `live - seen ${Math.round(age / 1000)}s ago` : "offline"}
+        </span>
         <span className="hint"> · f = fullscreen</span>
       </div>
 
@@ -109,22 +115,20 @@ export default function App() {
         ))}
       </div>
 
-      {relay?.frame && (
-        <img
-          ref={img}
-          className="view"
-          src={relay.frame}
-          alt="camera"
-          onClick={toggleBig}
-        />
-      )}
+      <img
+        key={attempt}
+        ref={img}
+        className="view"
+        src={STREAM}
+        alt="live camera"
+        onClick={toggleBig}
+        onError={onStreamEnd}
+      />
 
-      {relay?.frame && (
-        <div className="bar">
-          <button onClick={toggleBig}>{big ? "Exit fullscreen" : "Fullscreen"}</button>
-          <a className="btn" href={relay.frame} download="capture.jpg">Save frame</a>
-        </div>
-      )}
+      <div className="bar">
+        <button onClick={toggleBig}>{big ? "Exit fullscreen" : "Fullscreen"}</button>
+        <button onClick={() => setAttempt((a) => a + 1)}>Reconnect</button>
+      </div>
     </>
   );
 }
