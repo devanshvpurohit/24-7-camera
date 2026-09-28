@@ -1,11 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
-// ponytail: 3s poll of our own /api/device relay, not the camera.
-// The camera is behind NAT and has no inbound port. This only
-// updates as fast as the ESP32 pushes (status 30s, frame 3s) -
-// add SSE /events server-side if you want push instead of poll.
-const POLL_MS = 3000;
+// ponytail: fast poll of our own /api/device relay, not the camera.
+// The camera is behind NAT with no inbound port, and an https page
+// cannot load an http:// image anyway, so every frame has to come
+// through Vercel. The ETag/304 on the relay means a poll that finds
+// no new frame costs a few bytes, not a whole JPEG.
+const POLL_MS = 400;
 
+// Ceiling: this can never beat the device's FRAME_UPLOAD_INTERVAL,
+// and the relay adds one relay hop. Real streaming wants a
+// long-lived chunked response (MJPEG over SSE) on the device.
 const fmtUptime = (ms) => {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h ` +
@@ -31,15 +35,25 @@ const CARDS = [
 export default function App() {
   const [relay, setRelay] = useState(null);
   const [err, setErr] = useState("");
+  const [big, setBig] = useState(false);
+  const img = useRef(null);
 
   useEffect(() => {
     let stop = false;
     const tick = async () => {
       try {
-        const r = await (await fetch("/api/device")).json();
+        // "no-cache" revalidates: sends If-None-Match and honours a
+        // 304. "no-store" would skip the HTTP cache and re-download
+        // the whole frame on every poll.
+        const r = await fetch("/api/device", { cache: "no-cache" });
+        // 304 means no new frame. Keep the old <img> src so the
+        // picture does not flicker black between frames.
+        if (r.status === 304) return;
+        if (!r.ok) throw new Error(`relay ${r.status}`);
+        const j = await r.json();
         if (stop) return;
-        setRelay(r);
-        setErr(r.status ? "" : "waiting for camera to push");
+        setRelay(j);
+        setErr(j.status ? "" : "waiting for camera to push");
       } catch (e) {
         if (!stop) setErr(e.message);
       }
@@ -52,6 +66,24 @@ export default function App() {
     };
   }, []);
 
+  // Fullscreen the live view, the way a security monitor should work.
+  const toggleBig = useCallback(() => {
+    if (document.fullscreenElement) return document.exitFullscreen();
+    img.current?.requestFullscreen?.();
+  }, []);
+
+  useEffect(() => {
+    const on = () => setBig(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", on);
+    return () => document.removeEventListener("fullscreenchange", on);
+  }, []);
+
+  useEffect(() => {
+    const on = (e) => e.key === "f" && !e.target.matches("input,textarea") && toggleBig();
+    window.addEventListener("keydown", on);
+    return () => window.removeEventListener("keydown", on);
+  }, [toggleBig]);
+
   const d = relay?.status;
   const age = relay?.seenAt ? Date.now() - Date.parse(relay.seenAt) : null;
   const online = d && age != null && age < STALE_MS;
@@ -61,6 +93,7 @@ export default function App() {
       <h1>ESP32-CAM</h1>
       <div className="sub">
         {online ? `seen ${Math.round(age / 1000)}s ago` : "offline"}
+        <span className="hint"> · f = fullscreen</span>
       </div>
 
       {err && <div className="err">{err}</div>}
@@ -76,7 +109,22 @@ export default function App() {
         ))}
       </div>
 
-      {relay?.frame && <img src={relay.frame} alt="camera" />}
+      {relay?.frame && (
+        <img
+          ref={img}
+          className="view"
+          src={relay.frame}
+          alt="camera"
+          onClick={toggleBig}
+        />
+      )}
+
+      {relay?.frame && (
+        <div className="bar">
+          <button onClick={toggleBig}>{big ? "Exit fullscreen" : "Fullscreen"}</button>
+          <a className="btn" href={relay.frame} download="capture.jpg">Save frame</a>
+        </div>
+      )}
     </>
   );
 }

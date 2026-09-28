@@ -63,13 +63,24 @@ button:hover, .btn:hover { background: #222; }
 .bad { color: #ff5555; }
 .muted { color: #888; }
 
-img {
+img.view {
   width: 100%;
   max-width: 1000px;
   margin-top: 16px;
   border-radius: 8px;
   border: 1px solid #2a2a2a;
   display: block;
+  cursor: pointer;
 }
+
+img.view:fullscreen {
+  max-width: none;
+  border: 0;
+  border-radius: 0;
+  object-fit: contain;
+  background: #000;
+}
+
+.hint { color: #444; }
 
 .err { color: #ff5555; margin-bottom: 12px; }

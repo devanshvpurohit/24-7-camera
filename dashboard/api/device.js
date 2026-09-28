@@ -10,7 +10,7 @@
 // a second instance wipes it, and the ESP32's 3s POST keeps the instance warm
 // so it holds in practice. Vercel Blob / KV if you need it to survive scale-out.
 
-let last = { status: null, frame: null, seenAt: null };
+let last = { status: null, frame: null, seenAt: null, seq: 0 };
 
 export default function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -28,11 +28,27 @@ export default function handler(req, res) {
       if (buf.length) last.frame = buf.toString("base64");
     }
 
+    // seq, not the timestamp: Date has millisecond resolution and two
+    // pushes inside the same ms would repeat an ETag, leaving the
+    // dashboard stuck on a cached frame.
+    last.seq += 1;
     last.seenAt = new Date().toISOString();
     return res.status(200).json({ ok: true });
   }
 
   if (req.method === "GET") {
+    // ETag on seq: the dashboard polls far faster than the camera
+    // pushes, so most polls are "nothing new" and must not re-send
+    // the same ~60KB frame. 304 here is what makes the stream cheap.
+    const tag = `"${last.seq}"`;
+
+    res.setHeader("ETag", tag);
+    res.setHeader("Cache-Control", "no-cache");
+
+    if (req.headers["if-none-match"] === tag) {
+      return res.status(304).end();
+    }
+
     return res.status(200).json({
       status: last.status,
       seenAt: last.seenAt,

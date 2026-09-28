@@ -13,7 +13,7 @@
   - WiFi reconnect
   - HTTPS connection to Vercel
   - Vercel heartbeat
-  - Optional JPEG upload to Vercel
+  - JPEG upload to Vercel
 
   Board:
   AI Thinker ESP32-CAM
@@ -32,10 +32,6 @@
 // VERCEL
 // ============================================================
 
-// Vercel relay. The device is behind NAT, so the dashboard
-// cannot poll it directly. It POSTs here instead and the
-// dashboard reads it back from Vercel.
-// https://<host>/api/device
 #define VERCEL_HOST "https://dashboard-mocha-eight-63.vercel.app"
 #define VERCEL_ENDPOINT "/api/device"
 
@@ -94,13 +90,16 @@ bool apMode = false;
 unsigned long lastWifiRetry = 0;
 unsigned long lastVercelPing = 0;
 unsigned long lastFrameUpload = 0;
-
 unsigned long bootMillis = 0;
 
 int lastVercelCode = 0;
 
-#define VERCEL_PING_INTERVAL   30000UL
-#define FRAME_UPLOAD_INTERVAL   3000UL
+#define VERCEL_PING_INTERVAL  30000UL
+// Frame rate of the remote stream. 700ms ~= 1.4fps over the relay.
+// ponytail: JPEG size x this rate is the whole bandwidth bill. At VGA
+// q12 that is roughly 60KB every 700ms (~7Mbps up). Drop FRAMESIZE to
+// SVGA/HVGA and raise jpeg_quality (number = worse) if that hurts.
+#define FRAME_UPLOAD_INTERVAL 700UL
 
 // ============================================================
 // HTML CAMERA PAGE
@@ -109,8 +108,12 @@ int lastVercelCode = 0;
 const char CAMERA_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
+
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
 <title>ESP32-CAM</title>
 
 <style>
@@ -184,43 +187,49 @@ button:hover {
 }
 
 </style>
+
 </head>
 
 <body>
 
 <header>
-  <h1>ESP32-CAM</h1>
-  <div class="status" id="status">
-    Connecting...
-  </div>
+
+<h1>ESP32-CAM</h1>
+
+<div class="status" id="status">
+Connecting...
+</div>
+
 </header>
 
 <div class="camera">
-  <img id="stream" src="/stream">
+
+<img id="stream" src="/stream">
+
 </div>
 
 <div class="buttons">
 
-  <button onclick="capture()">
-    Capture
-  </button>
+<button onclick="capture()">
+Capture
+</button>
 
-  <button onclick="location.href='/dashboard'">
-    Dashboard
-  </button>
+<button onclick="location.href='/dashboard'">
+Dashboard
+</button>
 
-  <button onclick="location.reload()">
-    Refresh
-  </button>
+<button onclick="location.reload()">
+Refresh
+</button>
 
-  <button onclick="location.href='/status'">
-    Status
-  </button>
+<button onclick="location.href='/status'">
+Status
+</button>
 
 </div>
 
 <div class="info">
-  AI Thinker ESP32-CAM
+AI Thinker ESP32-CAM
 </div>
 
 <script>
@@ -230,6 +239,7 @@ async function checkStatus() {
   try {
 
     const response = await fetch('/status');
+
     const data = await response.json();
 
     document.getElementById("status").innerHTML =
@@ -265,6 +275,7 @@ setInterval(
 </script>
 
 </body>
+
 </html>
 )rawliteral";
 
@@ -275,8 +286,12 @@ setInterval(
 const char DASHBOARD_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
+
 <head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
 <title>ESP32-CAM Dashboard</title>
 
 <style>
@@ -330,8 +345,13 @@ h1 {
   word-break: break-all;
 }
 
-.ok { color: #00ff99; }
-.bad { color: #ff4d4d; }
+.ok {
+  color: #00ff99;
+}
+
+.bad {
+  color: #ff4d4d;
+}
 
 .preview {
   max-width: 1000px;
@@ -357,96 +377,145 @@ a.btn {
   font-size: 14px;
 }
 
-a.btn:hover { background: #222; }
+a.btn:hover {
+  background: #222;
+}
 
 </style>
+
 </head>
 
 <body>
 
 <h1>ESP32-CAM</h1>
-<div class="sub">Dashboard</div>
+
+<div class="sub">
+Dashboard
+</div>
 
 <div class="grid">
 
-  <div class="card">
-    <div class="k">WiFi</div>
-    <div class="v" id="wifi">-</div>
-  </div>
+<div class="card">
+<div class="k">WiFi</div>
+<div class="v" id="wifi">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">IP</div>
-    <div class="v" id="ip">-</div>
-  </div>
+<div class="card">
+<div class="k">IP</div>
+<div class="v" id="ip">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">SSID</div>
-    <div class="v" id="ssid">-</div>
-  </div>
+<div class="card">
+<div class="k">SSID</div>
+<div class="v" id="ssid">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">RSSI</div>
-    <div class="v" id="rssi">-</div>
-  </div>
+<div class="card">
+<div class="k">RSSI</div>
+<div class="v" id="rssi">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">Camera</div>
-    <div class="v" id="camera">-</div>
-  </div>
+<div class="card">
+<div class="k">Camera</div>
+<div class="v" id="camera">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">Uptime</div>
-    <div class="v" id="uptime">-</div>
-  </div>
+<div class="card">
+<div class="k">Uptime</div>
+<div class="v" id="uptime">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">Free Heap</div>
-    <div class="v" id="heap">-</div>
-  </div>
+<div class="card">
+<div class="k">Free Heap</div>
+<div class="v" id="heap">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">PSRAM</div>
-    <div class="v" id="psram">-</div>
-  </div>
+<div class="card">
+<div class="k">PSRAM</div>
+<div class="v" id="psram">-</div>
+</div>
 
-  <div class="card">
-    <div class="k">Relay</div>
-    <div class="v" id="clients">-</div>
-  </div>
+<div class="card">
+<div class="k">Relay</div>
+<div class="v" id="clients">-</div>
+</div>
 
 </div>
 
 <div class="preview">
-  <img src="/stream" alt="stream">
+
+<img src="/stream" alt="stream">
+
 </div>
 
-<a class="btn" href="/">Camera</a>
-<a class="btn" href="/capture" target="_blank">Capture</a>
-<a class="btn" href="/status" target="_blank">JSON</a>
-<a class="btn" href="/reset">Reset WiFi</a>
+<a class="btn" href="/">
+Camera
+</a>
+
+<a class="btn"
+href="/capture"
+target="_blank">
+Capture
+</a>
+
+<a class="btn"
+href="/status"
+target="_blank">
+JSON
+</a>
+
+<a class="btn"
+href="/reset">
+Reset WiFi
+</a>
 
 <script>
 
-// ponytail: 3s poll of the existing /status endpoint. Swap to
-// /events (SSE) only if this ever needs sub-second updates.
 const POLL_MS = 3000;
 
 function fmtUptime(ms) {
 
   const s = Math.floor(ms / 1000);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor(s % 86400 / 3600);
-  const m = Math.floor(s % 3600 / 60);
 
-  return d + "d " + h + "h " + m + "m " + (s % 60) + "s";
+  const d = Math.floor(s / 86400);
+
+  const h =
+    Math.floor(
+      s % 86400 / 3600
+    );
+
+  const m =
+    Math.floor(
+      s % 3600 / 60
+    );
+
+  return d +
+    "d " +
+    h +
+    "h " +
+    m +
+    "m " +
+    (s % 60) +
+    "s";
 
 }
 
 function set(id, text, good) {
 
-  const el = document.getElementById(id);
+  const el =
+    document.getElementById(id);
+
   el.textContent = text;
-  el.className = "v " + (good === undefined ? "" : good ? "ok" : "bad");
+
+  el.className =
+    "v " +
+    (
+      good === undefined
+      ? ""
+      : good
+        ? "ok"
+        : "bad"
+    );
 
 }
 
@@ -454,34 +523,99 @@ async function poll() {
 
   try {
 
-    const d = await (await fetch("/status")).json();
+    const response =
+      await fetch("/status");
 
-    const up = d.wifi === "connected";
+    const d =
+      await response.json();
 
-    set("wifi", d.wifi, up);
-    set("ip", d.ip || "-", up);
-    set("ssid", d.ssid || "-", up);
-    set("rssi", d.rssi + " dBm", up);
-    set("camera", d.camera ? "ready" : "error", d.camera);
-    set("uptime", fmtUptime(d.uptime));
-    set("heap", Math.round(d.heap / 1024) + " KB");
-    set("psram", d.psram > 0 ? Math.round(d.psram / 1024) + " KB" : "none");
-    set("clients", d.vercelOk ? "relay ok" : "relay failing", d.vercelOk);
+    const up =
+      d.wifi === "connected";
 
-  } catch (e) {
+    set(
+      "wifi",
+      d.wifi,
+      up
+    );
 
-    set("wifi", "offline", false);
+    set(
+      "ip",
+      d.ip || "-",
+      up
+    );
+
+    set(
+      "ssid",
+      d.ssid || "-",
+      up
+    );
+
+    set(
+      "rssi",
+      d.rssi + " dBm",
+      up
+    );
+
+    set(
+      "camera",
+      d.camera
+        ? "ready"
+        : "error",
+      d.camera
+    );
+
+    set(
+      "uptime",
+      fmtUptime(d.uptime)
+    );
+
+    set(
+      "heap",
+      Math.round(
+        d.heap / 1024
+      ) + " KB"
+    );
+
+    set(
+      "psram",
+      d.psram > 0
+        ? Math.round(
+            d.psram / 1024
+          ) + " KB"
+        : "none"
+    );
+
+    set(
+      "clients",
+      d.vercelOk
+        ? "relay ok"
+        : "relay failing",
+      d.vercelOk
+    );
+
+  } catch(e) {
+
+    set(
+      "wifi",
+      "offline",
+      false
+    );
 
   }
 
 }
 
 poll();
-setInterval(poll, POLL_MS);
+
+setInterval(
+  poll,
+  POLL_MS
+);
 
 </script>
 
 </body>
+
 </html>
 )rawliteral";
 
@@ -492,67 +626,129 @@ setInterval(poll, POLL_MS);
 bool initCamera() {
 
   Serial.println();
-  Serial.println("================================");
-  Serial.println("Initializing ESP32-CAM");
-  Serial.println("================================");
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "Initializing ESP32-CAM"
+  );
+
+  Serial.println(
+    "================================"
+  );
 
   camera_config_t config;
 
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
+  config.ledc_channel =
+    LEDC_CHANNEL_0;
 
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
+  config.ledc_timer =
+    LEDC_TIMER_0;
 
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
+  config.pin_d0 =
+    Y2_GPIO_NUM;
 
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_d1 =
+    Y3_GPIO_NUM;
 
-  config.pin_pwdn  = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
+  config.pin_d2 =
+    Y4_GPIO_NUM;
 
-  config.xclk_freq_hz = 20000000;
+  config.pin_d3 =
+    Y5_GPIO_NUM;
 
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pin_d4 =
+    Y6_GPIO_NUM;
 
-  // ----------------------------------------------------------
+  config.pin_d5 =
+    Y7_GPIO_NUM;
+
+  config.pin_d6 =
+    Y8_GPIO_NUM;
+
+  config.pin_d7 =
+    Y9_GPIO_NUM;
+
+  config.pin_xclk =
+    XCLK_GPIO_NUM;
+
+  config.pin_pclk =
+    PCLK_GPIO_NUM;
+
+  config.pin_vsync =
+    VSYNC_GPIO_NUM;
+
+  config.pin_href =
+    HREF_GPIO_NUM;
+
+  config.pin_sccb_sda =
+    SIOD_GPIO_NUM;
+
+  config.pin_sccb_scl =
+    SIOC_GPIO_NUM;
+
+  config.pin_pwdn =
+    PWDN_GPIO_NUM;
+
+  config.pin_reset =
+    RESET_GPIO_NUM;
+
+  config.xclk_freq_hz =
+    20000000;
+
+  config.pixel_format =
+    PIXFORMAT_JPEG;
+
+  // ==========================================================
   // PSRAM
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (psramFound()) {
 
-    Serial.println("[CAM] PSRAM detected");
+    Serial.println(
+      "[CAM] PSRAM detected"
+    );
 
-    config.frame_size = FRAMESIZE_VGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.frame_size =
+      FRAMESIZE_VGA;
+
+    config.jpeg_quality =
+      12;
+
+    config.fb_count =
+      2;
+
+    config.grab_mode =
+      CAMERA_GRAB_LATEST;
 
   } else {
 
-    Serial.println("[CAM] No PSRAM");
+    Serial.println(
+      "[CAM] No PSRAM"
+    );
 
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 15;
-    config.fb_count = 1;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.frame_size =
+      FRAMESIZE_QVGA;
+
+    config.jpeg_quality =
+      15;
+
+    config.fb_count =
+      1;
+
+    config.grab_mode =
+      CAMERA_GRAB_WHEN_EMPTY;
   }
 
-  // ----------------------------------------------------------
-  // Init
-  // ----------------------------------------------------------
+  // ==========================================================
+  // INIT
+  // ==========================================================
 
-  esp_err_t err = esp_camera_init(&config);
+  esp_err_t err =
+    esp_camera_init(
+      &config
+    );
 
   if (err != ESP_OK) {
 
@@ -564,7 +760,8 @@ bool initCamera() {
     return false;
   }
 
-  sensor_t *sensor = esp_camera_sensor_get();
+  sensor_t *sensor =
+    esp_camera_sensor_get();
 
   if (sensor) {
 
@@ -591,7 +788,9 @@ bool initCamera() {
     );
   }
 
-  Serial.println("[CAM] Camera initialized");
+  Serial.println(
+    "[CAM] Camera initialized"
+  );
 
   return true;
 }
@@ -603,10 +802,16 @@ bool initCamera() {
 bool wifiConnectSaved() {
 
   String ssid =
-    prefs.getString("ssid", "");
+    prefs.getString(
+      "ssid",
+      ""
+    );
 
   String pass =
-    prefs.getString("pass", "");
+    prefs.getString(
+      "pass",
+      ""
+    );
 
   if (ssid.length() == 0) {
 
@@ -618,6 +823,7 @@ bool wifiConnectSaved() {
   }
 
   Serial.println();
+
   Serial.println(
     "================================"
   );
@@ -632,7 +838,9 @@ bool wifiConnectSaved() {
     "================================"
   );
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(
+    WIFI_STA
+  );
 
   WiFi.begin(
     ssid.c_str(),
@@ -645,7 +853,7 @@ bool wifiConnectSaved() {
   while (
     WiFi.status() != WL_CONNECTED &&
     millis() - start <
-    WIFI_CONNECT_TIMEOUT_MS
+      WIFI_CONNECT_TIMEOUT_MS
   ) {
 
     delay(300);
@@ -743,6 +951,8 @@ String buildNetworkOptions() {
       "</option>";
   }
 
+  WiFi.scanDelete();
+
   return html;
 }
 
@@ -755,10 +965,9 @@ void handleSetupRoot() {
   String options =
     buildNetworkOptions();
 
-  String html = R"rawliteral(
-
+  String html =
+    R"rawliteral(
 <!DOCTYPE html>
-
 <html>
 
 <head>
@@ -786,7 +995,8 @@ h1 {
   text-align:center;
 }
 
-input,select {
+input,
+select {
   width:100%;
   padding:13px;
   margin:8px 0;
@@ -820,7 +1030,9 @@ button {
 <form action="/connect"
 method="POST">
 
-<label>WiFi Network</label>
+<label>
+WiFi Network
+</label>
 
 <select name="ssid">
 
@@ -828,11 +1040,14 @@ method="POST">
 
   html += options;
 
-  html += R"rawliteral(
+  html +=
+    R"rawliteral(
 
 </select>
 
-<label>Password</label>
+<label>
+Password
+</label>
 
 <input
 type="password"
@@ -899,6 +1114,7 @@ void handleConnect() {
     server.arg("pass");
 
   Serial.println();
+
   Serial.println(
     "[AP] Saving WiFi credentials"
   );
@@ -919,10 +1135,9 @@ void handleConnect() {
     pass
   );
 
-  String html = R"rawliteral(
-
+  String html =
+    R"rawliteral(
 <!DOCTYPE html>
-
 <html>
 
 <head>
@@ -939,12 +1154,13 @@ style="background:#050505;color:white;font-family:Arial;text-align:center;paddin
 
 <h1>WiFi Saved</h1>
 
-<p>ESP32-CAM is restarting...</p>
+<p>
+ESP32-CAM is restarting...
+</p>
 
 </body>
 
 </html>
-
 )rawliteral";
 
   server.send(
@@ -965,6 +1181,7 @@ style="background:#050505;color:white;font-family:Arial;text-align:center;paddin
 void handleReset() {
 
   prefs.remove("ssid");
+
   prefs.remove("pass");
 
   server.send(
@@ -1058,7 +1275,8 @@ void handleCapture() {
   );
 
   esp_camera_fb_return(
-    fb);
+    fb
+  );
 }
 
 // ============================================================
@@ -1131,7 +1349,8 @@ void handleStream() {
     );
 
     esp_camera_fb_return(
-      fb);
+      fb
+    );
 
     delay(30);
   }
@@ -1200,7 +1419,9 @@ String statusJson() {
     "\"uptime\":";
 
   json +=
-    String(millis() - bootMillis);
+    String(
+      millis() - bootMillis
+    );
 
   json += ",";
 
@@ -1208,7 +1429,9 @@ String statusJson() {
     "\"heap\":";
 
   json +=
-    String(ESP.getFreeHeap());
+    String(
+      ESP.getFreeHeap()
+    );
 
   json += ",";
 
@@ -1216,7 +1439,9 @@ String statusJson() {
     "\"psram\":";
 
   json +=
-    String(ESP.getFreePsram());
+    String(
+      ESP.getFreePsram()
+    );
 
   json += ",";
 
@@ -1235,7 +1460,6 @@ String statusJson() {
 
 void handleStatus() {
 
-  // CORS so a browser on another origin can read this
   server.sendHeader(
     "Access-Control-Allow-Origin",
     "*"
@@ -1379,6 +1603,7 @@ void startSetupAP() {
     WiFi.softAPIP();
 
   Serial.println();
+
   Serial.println(
     "================================"
   );
@@ -1399,13 +1624,17 @@ void startSetupAP() {
     "IP: "
   );
 
-  Serial.println(ip);
+  Serial.println(
+    ip
+  );
 
   Serial.print(
     "AP started: "
   );
 
-  Serial.println(ok ? "YES" : "NO");
+  Serial.println(
+    ok ? "YES" : "NO"
+  );
 
   Serial.println(
     "================================"
@@ -1450,10 +1679,17 @@ void startSetupAP() {
 
 // ============================================================
 // VERCEL RELAY
+// ============================================================
 //
-// Device is behind NAT, so it pushes state to Vercel and the
-// dashboard reads it back from there. One helper, two callers:
-// status JSON and a JPEG frame.
+// IMPORTANT:
+// ESP32 Arduino Core 3.3.11 defines:
+//
+// HTTPClient::POST(uint8_t *payload, size_t size)
+//
+// but our function uses const uint8_t*.
+//
+// const_cast is used only at the POST call because
+// HTTPClient does not need to modify the payload.
 // ============================================================
 
 int vercelPost(
@@ -1466,6 +1702,11 @@ int vercelPost(
     WiFi.status() !=
     WL_CONNECTED
   ) {
+
+    Serial.println(
+      "[Vercel] WiFi not connected"
+    );
+
     return -1;
   }
 
@@ -1474,6 +1715,9 @@ int vercelPost(
     VERCEL_ENDPOINT;
 
   WiFiClientSecure client;
+
+  // Vercel uses HTTPS.
+  // This skips certificate verification.
   client.setInsecure();
 
   HTTPClient http;
@@ -1506,31 +1750,42 @@ int vercelPost(
     "ESP32-CAM/1.0"
   );
 
+  // ==========================================================
+  // FIX FOR ESP32 CORE 3.3.11
+  // ==========================================================
+
   int code =
     http.POST(
-      body,
+      const_cast<uint8_t *>(body),
       len
     );
 
-  lastVercelCode = code;
+  lastVercelCode =
+    code;
 
   Serial.print(
     "[Vercel] POST "
   );
 
-  Serial.print(url);
+  Serial.print(
+    url
+  );
 
   Serial.print(
     " -> "
   );
 
-  Serial.print(code);
+  Serial.print(
+    code
+  );
 
   Serial.print(
     " ("
   );
 
-  Serial.print(len);
+  Serial.print(
+    len
+  );
 
   Serial.println(
     " bytes)"
@@ -1546,7 +1801,7 @@ int vercelPost(
       http.errorToString(code)
     );
 
-  } else if (code == 200) {
+  } else {
 
     Serial.print(
       "[Vercel] Response: "
@@ -1562,6 +1817,10 @@ int vercelPost(
   return code;
 }
 
+// ============================================================
+// PUSH STATUS TO VERCEL
+// ============================================================
+
 void pushStatusToVercel() {
 
   String json =
@@ -1574,9 +1833,19 @@ void pushStatusToVercel() {
   );
 }
 
+// ============================================================
+// PUSH CAMERA FRAME TO VERCEL
+// ============================================================
+
 void pushFrameToVercel() {
 
+  // ponytail: this blocks the loop for the whole HTTPS POST, so the
+  // local /stream and /capture page stutter while a frame is going up
+  // and the real frame rate is capped by upload time rather than by
+  // FRAME_UPLOAD_INTERVAL. Non-blocking upload (a FreeRTOS task) if
+  // the local page needs to stay smooth.
   if (!cameraReady) {
+
     return;
   }
 
@@ -1612,6 +1881,7 @@ void checkWiFi() {
   if (
     apMode
   ) {
+
     return;
   }
 
@@ -1684,32 +1954,36 @@ void setup() {
 
   delay(1000);
 
-  bootMillis = millis();
+  bootMillis =
+    millis();
 
   Serial.println();
   Serial.println();
-  Serial.println(
-    "========================================"
-  );
-  Serial.println(
-    "      ESP32-CAM + VERCEL"
-  );
+
   Serial.println(
     "========================================"
   );
 
-  // ----------------------------------------------------------
+  Serial.println(
+    "       ESP32-CAM + VERCEL"
+  );
+
+  Serial.println(
+    "========================================"
+  );
+
+  // ==========================================================
   // Preferences
-  // ----------------------------------------------------------
+  // ==========================================================
 
   prefs.begin(
     "cam-wifi",
     false
   );
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // Camera
-  // ----------------------------------------------------------
+  // ==========================================================
 
   cameraReady =
     initCamera();
@@ -1721,9 +1995,9 @@ void setup() {
     );
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // WiFi
-  // ----------------------------------------------------------
+  // ==========================================================
 
   bool connected =
     wifiConnectSaved();
@@ -1736,7 +2010,7 @@ void setup() {
 
     delay(1000);
 
-    // First push to Vercel
+    // First Vercel status push
     pushStatusToVercel();
 
   } else {
@@ -1751,9 +2025,9 @@ void setup() {
 
 void loop() {
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // Captive portal
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (apMode) {
 
@@ -1766,27 +2040,30 @@ void loop() {
     return;
   }
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // Camera server
-  // ----------------------------------------------------------
+  // ==========================================================
 
   server.handleClient();
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // WiFi
-  // ----------------------------------------------------------
+  // ==========================================================
 
   checkWiFi();
 
-  // ----------------------------------------------------------
-  // Push state to Vercel. The dashboard reads it from there,
-  // so the device needs no inbound port.
-  // ----------------------------------------------------------
+  // ==========================================================
+  // Vercel
+  // ==========================================================
 
   if (
     WiFi.status() ==
     WL_CONNECTED
   ) {
+
+    // --------------------------------------------------------
+    // Status
+    // --------------------------------------------------------
 
     if (
       millis() -
@@ -1801,7 +2078,7 @@ void loop() {
     }
 
     // --------------------------------------------------------
-    // Upload latest camera frame
+    // Camera frame
     // --------------------------------------------------------
 
     if (
